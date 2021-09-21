@@ -327,14 +327,14 @@ PickleOpCode Unpickler::readInstruction() {
     case PickleOpCode::TUPLE: {
       size_t start = marks_.back();
       marks_.pop_back();
-      auto tuple = c10::ivalue::Tuple::create({});
-      tuple->elements().reserve(stack_.size() - start);
+      std::vector<IValue> elements;
+      elements.reserve(stack_.size() - start);
       auto start_it = stack_.begin() + start;
       for (auto it = start_it; it != stack_.end(); ++it) {
-        tuple->elements().emplace_back(std::move(*it));
+        elements.emplace_back(std::move(*it));
       }
       stack_.erase(start_it, stack_.end());
-      stack_.emplace_back(std::move(tuple));
+      stack_.emplace_back(c10::ivalue::Tuple::create(std::move(elements)));
     } break;
     case PickleOpCode::TUPLE1: {
       stack_.emplace_back(c10::ivalue::Tuple::create(pop(stack_, 1)));
@@ -409,7 +409,8 @@ PickleOpCode Unpickler::readInstruction() {
       globals_.at(idx)();
     } break;
     case PickleOpCode::BINPERSID: {
-      auto args = pop(stack_).toTuple()->elements();
+      auto tuple = pop(stack_).toTuple();
+      const auto& args = tuple->elements();
       AT_ASSERT(
           args.at(0).toStringRef() == "storage",
           "unknown PERSID key ",
@@ -512,7 +513,7 @@ void Unpickler::readGlobal(
       });
     } else if (class_name == "restore_type_tag") {
       globals_.emplace_back([this] {
-        auto data = stack_.back().toTuple()->elements();
+        auto data = std::move(*std::move(stack_.back()).toTuple()).elements();
         auto type_str = data.at(1).toStringRef();
         stack_.pop_back();
         TypePtr type = nullptr;
@@ -568,7 +569,8 @@ void Unpickler::readGlobal(
     rebuildSparseTensor();
   } else if (module_name == "builtins" && class_name == "complex") {
     globals_.emplace_back([this] {
-      auto elems = pop(stack_).toTuple()->elements();
+      auto tuple = pop(stack_).toTuple();
+      const auto& elems = tuple->elements();
       AT_ASSERT(elems.size() == 2);
       auto complex =
           c10::complex<double>(elems.at(0).toDouble(), elems.at(1).toDouble());
@@ -750,7 +752,8 @@ void Unpickler::rebuildRRef() {
   globals_.emplace_back([this] {
     // It is the same as how rref is unpickled in python,
     // see PyRRef::unpickle
-    auto args = stack_.back().toTuple()->elements();
+    auto tuple = std::move(stack_.back()).toTuple();
+    const auto& args = tuple->elements();
     stack_.pop_back();
     TORCH_INTERNAL_ASSERT(
         args.size() == distributed::rpc::RFD_TUPLE_SIZE,
