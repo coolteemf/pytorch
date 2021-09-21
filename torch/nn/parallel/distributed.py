@@ -188,6 +188,8 @@ class _DDPJoinHook(JoinHook):
 
         # Schedule a broadcast if we are syncing module buffers in the
         # forward pass
+        # TODO: make DDP uneven inputs context manager support buffer
+        # comm hook.
         ddp._check_and_sync_module_buffers()
 
         # Check if need to sync in the backward pass
@@ -893,13 +895,9 @@ class DistributedDataParallel(Module, Joinable):
 
             # sync params according to location (before/after forward) user
             # specified as part of hook, if hook was specified.
-            buffer_hook_registered = hasattr(self, 'buffer_hook')
-            if self.require_forward_param_sync and (
-                not buffer_hook_registered
-                or self.buffer_hook.buffer_comm_hook_location
-                == _BufferCommHookLocation.PRE_FORWARD
-            ):
-                self._sync_params()
+            self._check_and_sync_module_buffers(
+                buffer_comm_hook_location=_BufferCommHookLocation.PRE_FORWARD
+            )
 
             if self._join_config.enable:
                 # Notify joined ranks whether they should sync in backwards pass or not.
@@ -913,13 +911,9 @@ class DistributedDataParallel(Module, Joinable):
 
             # sync params according to location (before/after forward) user
             # specified as part of hook, if hook was specified.
-            if (
-                self.require_forward_param_sync
-                and buffer_hook_registered
-                and self.buffer_hook.buffer_comm_hook_location
-                == _BufferCommHookLocation.POST_FORWARD
-            ):
-                self._sync_params()
+            self._check_and_sync_module_buffers(
+                buffer_comm_hook_location=_BufferCommHookLocation.POST_FORWARD
+            )
 
             if torch.is_grad_enabled() and self.require_backward_grad_sync:
                 self.require_forward_param_sync = True
@@ -1061,12 +1055,18 @@ class DistributedDataParallel(Module, Joinable):
         )
         return work
 
-    # When running in join mode, checks and performs sync of module buffers if
-    # the models have buffers that should be synchronized in the forward pass.
-    def _check_and_sync_module_buffers(self):
-        if self.will_sync_module_buffers():
-            authoritative_rank = self._find_common_rank(self._distributed_rank, False)
-            self._sync_module_buffers(authoritative_rank)
+    # Checks and performs sync of module buffes if the models have buffers
+    # that should be synced in the forward pass. Called from both DDP forward
+    # as well as DDP join context manager.
+    def _check_and_sync_module_buffers(
+        self,
+        buffer_comm_hook_location=_BufferCommHookLocation.PRE_FORWARD
+    ):
+        if self.will_sync_module_buffers(buffer_comm_hook_location):
+            with torch.no_grad():
+                authoritative_rank = self._find_common_rank(self._distributed_rank, False) if self._join_config.enable else 0
+                self._assign_modules_buffers()
+                self._sync_module_buffers(authoritative_rank)
 
     # When running in join model, agrees upon a common rank and broadcast model
     # parameters to all other ranks.
@@ -1381,11 +1381,16 @@ class DistributedDataParallel(Module, Joinable):
             self.process_group, tensors, buffer_size, authoritative_rank
         )
 
-    def will_sync_module_buffers(self):
+    def will_sync_module_buffers(self, buffer_comm_hook_location):
+        # TODO: Cache this in first iteration
+        buffer_hook_registered = hasattr(self, 'buffer_hook')
         return (
-            self.require_forward_param_sync
-            and self.broadcast_buffers
-            and len(self.modules_buffers) > 0
+            self.require_forward_param_sync and (
+                self.broadcast_buffers and len(self.modules_buffers) > 0
+            ) and (
+                not buffer_hook_registered
+                or self.buffer_hook.buffer_comm_hook_location == buffer_comm_hook_location
+            )
         )
 
     def _find_common_rank(self, input_rank, rank_cond):
@@ -1403,26 +1408,6 @@ class DistributedDataParallel(Module, Joinable):
                 " This indicates a bug in PyTorch, please report an issue.",
             )
         return rank_to_use.item()
-
-    def _sync_params(self):
-        with torch.no_grad():
-            # module buffer sync
-            if self.will_sync_module_buffers():
-                # Synchronize buffers across processes.
-                # If we are running DDP with the join manager, we have to agree
-                # upon a rank to sync module buffers from, since rank 0 may
-                # already have been joined and have stale module buffers.
-                if self._join_config.enable:
-                    authoritative_rank = self._find_common_rank(
-                        self._distributed_rank, True
-                    )
-                else:
-                    # The process with rank 0 is considered the authoritative copy.
-                    authoritative_rank = 0
-                # Update self.modules_buffers incase any buffers were
-                # reassigned.
-                self._assign_modules_buffers()
-                self._sync_module_buffers(authoritative_rank)
 
     def _sync_module_buffers(self, authoritative_rank):
         if not hasattr(self, 'buffer_hook'):
